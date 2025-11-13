@@ -129,215 +129,102 @@ def get_query_hash(query):
     return hashlib.md5(query.lower().strip().encode('utf-8')).hexdigest()
 
 def ask(query: str):
+    """
+    Responde preguntas usando la base de conocimiento.
+    """
     try:
-        start_time = time.time()
-        logger.info(f"Procesando consulta: {query}")
+        logger.info(f"🔍 Procesando consulta: {query}")
         
-        # Verificar en caché
+        # Verificar caché
         query_hash = get_query_hash(query)
         if query_hash in RESPONSE_CACHE:
-            logger.info(f"Respuesta encontrada en caché para: {query}")
-            elapsed_time = time.time() - start_time
-            logger.info(f"Consulta procesada desde caché en {elapsed_time:.2f} segundos")
+            logger.info("✅ Respuesta encontrada en caché")
             return RESPONSE_CACHE[query_hash]
         
-        # Configurar embeddings y vectorstore
-        os.makedirs(DATA_DIR, exist_ok=True)
-        os.makedirs(EMBEDDING_CACHE_DIR, exist_ok=True)
+        # Verificar que exista la base de datos
+        if not os.path.exists(PERSIST_DIR):
+            logger.error("❌ Directorio de persistencia no existe")
+            return "❌ Base de conocimiento no encontrada. Por favor, ejecuta primero la ingestión de documentos."
         
-        embedding = FastEmbedEmbeddings(
+        logger.info("📥 Configurando embeddings...")
+        # Configurar embeddings y vectorstore
+        embeddings = FastEmbedEmbeddings(
             model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             cache_dir=EMBEDDING_CACHE_DIR
         )
         
-        # Verificar que el directorio de persistencia exista
-        if not os.path.exists(PERSIST_DIR):
-            logger.error(f"El directorio de persistencia {PERSIST_DIR} no existe.")
-            return "Lo siento, ha ocurrido un error al cargar la base de conocimiento. Por favor, asegúrate de que se ha realizado la ingestión de documentos."
-        
+        logger.info("📥 Cargando vectorstore...")
         vectorstore = Chroma(
-            persist_directory=PERSIST_DIR, 
-            embedding_function=embedding,
-            collection_metadata={"hnsw:space": "cosine"}
+            persist_directory=PERSIST_DIR,
+            embedding_function=embeddings
         )
         
-        # Analizamos la query para determinar el mejor retriever
-        query_lower = query.lower()
+        # Verificar que hay documentos
+        logger.info("🔍 Verificando documentos en vectorstore...")
+        try:
+            test_docs = vectorstore.similarity_search("universidad", k=1)
+            logger.info(f"📄 Documentos encontrados en prueba: {len(test_docs)}")
+            if not test_docs:
+                return "❌ La base de conocimiento está vacía. Por favor, reingesta los documentos."
+        except Exception as e:
+            logger.error(f"❌ Error en similarity_search: {str(e)}")
+            return f"❌ Error accediendo a la base de conocimiento: {str(e)}"
         
-        # Palabras clave que sugieren consulta sobre preguntas frecuentes
-        faq_keywords = ["pregunta", "frecuente", "común", "duda", "consulta", "inquietud", 
-                       "cómo", "como", "proceso", "trámite", "tramite", "inscripción", "inscripcion", 
-                       "matrícula", "matricula", "admisión", "admision", "horario", "calendario", 
-                       "servicio", "bienestar", "plazo", "fecha", "requisito", "paso", "procedimiento"]
+        # Configurar retriever
+        logger.info("🔧 Configurando retriever...")
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
         
-        # Palabras clave que sugieren consulta sobre reglamento - AMPLIADAS
-        reglamento_keywords = ["reglamento", "norma", "regla", "artículo", "articulo", "sanción", "sancion", 
-                               "prohibición", "prohibicion", "obligación", "obligacion", "derecho", "deber", 
-                               "estatuto", "código", "codigo", "disciplina", "académico", "academico", 
-                               "calificación", "calificacion", "nota", "evaluación", "evaluacion", "examen",
-                               "falta", "gravísima", "gravisima", "grave", "leve", "suspensión", "suspension",
-                               "cancelación", "cancelacion", "matrícula", "matricula", "disciplinaria", "disciplinario",
-                               "conducta", "comportamiento", "infracción", "infraccion", "penalidad", "castigo"]
+        # Probamos el retriever
+        logger.info("🔍 Probando retriever...")
+        retrieved_docs = retriever.get_relevant_documents(query)
+        logger.info(f"📄 Documentos recuperados: {len(retrieved_docs)}")
         
-        # Verificar si la consulta parece una pregunta de FAQ basada en su estructura
-        is_question_structure = any(query_lower.startswith(prefix) for prefix in ["cómo", "como", "qué", "que", "cuál", "cual", "dónde", "donde", "cuándo", "cuando"])
+        if not retrieved_docs:
+            return "❌ No se encontró información relevante para tu pregunta en los documentos."
         
-        # Verificar si la consulta contiene palabras clave específicas
-        is_faq_related = any(keyword in query_lower for keyword in faq_keywords) or is_question_structure
-        is_reglamento_related = any(keyword in query_lower for keyword in reglamento_keywords)
-        
-        # Si la consulta contiene términos específicos que SIEMPRE deben dirigirse al reglamento
-        critical_reglamento_terms = ["sanción", "sancion", "falta", "gravísima", "gravisima", "grave", 
-                                    "disciplinaria", "suspensión", "suspension", "cancelación", "cancelacion"]
-        is_critical_reglamento = any(term in query_lower for term in critical_reglamento_terms)
-        
-        search_kwargs = {"k": 5}
-        # Estrategia de búsqueda
-        if is_critical_reglamento:
-            # Para términos críticos del reglamento, ignorar cualquier otra clasificación
-            logger.info(f"Consulta clasificada como CRÍTICA DE REGLAMENTO: {query}")
-            search_kwargs = {"k": 6, "filter": {"document_type": "reglamento_universitario"}}
-            
-        elif is_faq_related and not is_reglamento_related:
-            # Priorizar preguntas frecuentes - Estrategia específica para FAQ
-            logger.info(f"Consulta clasificada como FAQ: {query}")
-            search_kwargs = {"k": 6, "filter": {"document_type": "preguntas_frecuentes"}}
-            
-        elif is_reglamento_related and not is_faq_related:
-            # Priorizar reglamento
-            logger.info(f"Consulta clasificada como reglamento: {query}")
-            search_kwargs = {"k": 6, "filter": {"document_type": "reglamento_universitario"}}
-            
-        else:
-            # Estrategia híbrida: Evaluar ambas fuentes
-            logger.info(f"Consulta mixta o general: {query}")
-            
-            # Usar una estrategia basada en scores de similitud para determinar la mejor fuente
-            try:
-                # Obtener documentos de ambas fuentes para comparar relevancia
-                faq_retriever = vectorstore.as_retriever(
-                    search_kwargs={"k": 3, "filter": {"document_type": "preguntas_frecuentes"}}
-                )
-                reglamento_retriever = vectorstore.as_retriever(
-                    search_kwargs={"k": 3, "filter": {"document_type": "reglamento_universitario"}}
-                )
-                
-                # Verificar contenido de ambos documentos
-                faq_docs = faq_retriever.get_relevant_documents(query)
-                reglamento_docs = reglamento_retriever.get_relevant_documents(query)
-                
-                # Realizar evaluación de relevancia entre documentos
-                use_faq = False
-                
-                # Si encontramos documentos en FAQ pero ninguno en reglamento
-                if faq_docs and not reglamento_docs:
-                    logger.info("Solo se encontraron documentos FAQ - usando FAQ")
-                    use_faq = True
-                
-                # Si encontramos documentos en reglamento pero ninguno en FAQ
-                elif reglamento_docs and not faq_docs:
-                    logger.info("Solo se encontraron documentos de reglamento - usando reglamento")
-                    use_faq = False
-                
-                # Si encontramos documentos en ambas fuentes, evaluar palabras clave en el contenido
-                elif faq_docs and reglamento_docs:
-                    # Buscar términos críticos en los contenidos recuperados
-                    reglamento_content = " ".join([doc.page_content.lower() for doc in reglamento_docs])
-                    
-                    # Verificar si hay términos críticos en el contenido del reglamento
-                    if any(term in reglamento_content for term in critical_reglamento_terms):
-                        logger.info("Se encontraron términos críticos en el contenido del reglamento - priorizando reglamento")
-                        use_faq = False
-                    else:
-                        # En caso de duda para consultas generales, preferir FAQ por ser más directas
-                        logger.info("No se encontraron términos críticos - usando FAQ por defecto para consultas generales")
-                        use_faq = True
-                
-                # Configurar retriever según la evaluación
-                if use_faq:
-                    search_kwargs = {"k": 6, "filter": {"document_type": "preguntas_frecuentes"}}
-                    logger.info("Seleccionado: Documento de Preguntas Frecuentes")
-                else:
-                    search_kwargs = {"k": 6, "filter": {"document_type": "reglamento_universitario"}}
-                    logger.info("Seleccionado: Reglamento Universitario")
-                
-            except Exception as e:
-                logger.warning(f"Error en evaluación de fuentes: {str(e)}")
-                # Si hay error, usar estrategia mixta con más documentos
-                search_kwargs = {"k": 7}
-        
-        # Crear un retriever con los parámetros determinados
-        retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
-        
-        # Prompt mejorado con instrucciones más precisas y énfasis en la fuente
+        # Prompt
         prompt = ChatPromptTemplate.from_template("""
-        Eres Ardy, un asistente virtual especializado en información universitaria de la Universidad de Ibagué. 
-        Responde de forma clara, concisa y amigable, basándote exclusivamente en la siguiente información:
+        Eres Ardy, un asistente de la Universidad de Ibagué. Responde amablemente 
+        basándote SOLO en la información proporcionada:
 
         {context}
 
-        Reglas importantes:
-        1. Tus respuestas deben ser amigables y conversacionales, dirigidas a estudiantes universitarios.
-        2. SIEMPRE debes mencionar específicamente la fuente de tu información, indicando si proviene del "Reglamento Universitario" o del documento de "Preguntas Frecuentes".
-        3. Si la pregunta es sobre normas, sanciones, derechos, deberes o aspectos disciplinarios, asegúrate de usar la información del "Reglamento Universitario".
-        4. Da preferencia a la información más específica y completa sobre el tema consultado.
-        5. Si la información está parcialmente en el contexto, proporciona lo que encuentres e indica qué parte falta.
-        6. Si la información no está en el contexto, indica claramente que no tienes esa información en los documentos disponibles.
-        7. No inventes información ni interpretes más allá de lo que está explícitamente en el contexto.
-        8. Proporciona respuestas directas y específicas a la pregunta del usuario.
+        Pregunta: {input}
 
-        Pregunta del estudiante: {input}
+        Respuesta (sé claro y conciso):
         """)
         
-        # Configuración del modelo con parámetros optimizados
+        # Modelo
+        logger.info("🤖 Configurando modelo Ollama...")
         model = ChatOllama(
             model="llama3",
-            temperature=0.1,  # Baja temperatura para respuestas más precisas
-            num_predict=1024,  # Aumentado para permitir respuestas más completas
-            stop=["Estudiante:", "Usuario:", "Human:"],  # Evitar que el modelo continúe la conversación
-            repeat_penalty=1.2,  # Penalizar repeticiones
+            temperature=0.1,
+            num_predict=512,
         )
         
-        # Crear una cadena de documentos optimizada
-        document_chain = create_stuff_documents_chain(
-            llm=model,
-            prompt=prompt,
-            document_variable_name="context"
-        )
+        # Crear cadena
+        logger.info("⛓️ Creando cadenas...")
+        document_chain = create_stuff_documents_chain(model, prompt)
+        retrieval_chain = create_retrieval_chain(retriever, document_chain)
         
-        # Crear la cadena de recuperación
-        retrieval_chain = create_retrieval_chain(
-            retriever=retriever,
-            combine_docs_chain=document_chain
-        )
-        
-        # Invocar la cadena con el retriever adecuado
+        # Ejecutar
+        logger.info("🚀 Invocando cadena...")
         response = retrieval_chain.invoke({"input": query})
         
-        elapsed_time = time.time() - start_time
-        logger.info(f"Consulta procesada en {elapsed_time:.2f} segundos")
+        logger.info(f"📝 Respuesta recibida: {len(response)} elementos")
+        logger.info(f"📝 Keys en respuesta: {list(response.keys())}")
         
-        if "answer" in response:
-            answer = response["answer"]
-            
-            # Guardar en caché
-            if len(RESPONSE_CACHE) >= MAX_CACHE_SIZE:
-                # Eliminar una entrada aleatoria si el caché está lleno
-                RESPONSE_CACHE.pop(next(iter(RESPONSE_CACHE)))
-            RESPONSE_CACHE[query_hash] = answer
-            
-            return answer
-        else:
-            logger.error(f"La respuesta no contiene el campo 'answer': {response}")
-            return "Lo siento, ha ocurrido un error al generar la respuesta."
+        answer = response.get("answer", "No se pudo generar respuesta")
+        
+        # Guardar en caché
+        RESPONSE_CACHE[query_hash] = answer
+        
+        logger.info("✅ Consulta procesada exitosamente")
+        return answer
+        
     except Exception as e:
-        logger.error(f"Error al procesar la consulta: {str(e)}", exc_info=True)
-        
-        # Mensaje de error más descriptivo
-        error_msg = str(e)
-        if "Collection.query()" in error_msg and "unexpected keyword argument" in error_msg:
-            return "Error en la configuración de búsqueda. Por favor, contacta al administrador del sistema para reingestar los documentos."
-        elif "no such file or directory" in error_msg.lower():
-            return "Error al acceder a la base de conocimiento. Por favor, utiliza el botón 'Reingestar Documentos' en el panel lateral."
-        
-        return "Lo siento, ha ocurrido un error. Por favor, intenta de nuevo o reinicia la aplicación."
+        error_msg = f"❌ Error procesando consulta: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        import traceback
+        logger.error(traceback.format_exc())
+        return f"Lo siento, ha ocurrido un error: {str(e)}"
